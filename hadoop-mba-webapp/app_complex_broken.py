@@ -1,0 +1,472 @@
+﻿"""
+Market Basket Analysis - Flask Backend
+Interfaces with Hadoop/YARN for distributed processing
+"""
+
+from flask import Flask, render_template, request, jsonify, send_file
+import os
+import subprocess
+import json
+import time
+import uuid
+import requests
+from pathlib import Path
+import shutil
+import platform
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# Ensure directories exist
+Path(app.config['UPLOAD_FOLDER']).mkdir(exist_ok=True)
+
+# Auto-detect HADOOP_HOME
+HADOOP_HOME = os.environ.get('HADOOP_HOME', '')
+if not HADOOP_HOME:
+    print("WARNING: HADOOP_HOME environment variable not set!")
+    # Try common locations
+    common_paths = [
+        'C:\\hadoop-3.4.2\\hadoop-3.4.2',
+        '/usr/local/hadoop',
+        '/opt/hadoop'
+    ]
+    for path in common_paths:
+        if os.path.exists(path):
+            HADOOP_HOME = path
+            print(f"Auto-detected HADOOP_HOME: {HADOOP_HOME}")
+            break
+
+HDFS_INPUT = '/mba/input'
+HDFS_OUTPUT = '/mba/output'
+
+# Auto-detect JAR path
+JAR_PATH = None
+possible_jar_paths = [
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'market-basket-analysis', 'output', 'marketbasket.jar'),
+    os.path.join(os.getcwd(), '..', 'market-basket-analysis', 'output', 'marketbasket.jar'),
+    'C:\\Users\\Harish\\OneDrive\\Desktop\\Big Boys\\market-basket-analysis\\output\\marketbasket.jar'
+]
+
+for path in possible_jar_paths:
+    if os.path.exists(path):
+        JAR_PATH = os.path.abspath(path)
+        print(f"Found JAR at: {JAR_PATH}")
+        break
+
+if not JAR_PATH:
+    print("WARNING: marketbasket.jar not found! Please compile the Java code first.")
+
+class HadoopManager:
+    """Manages Hadoop operations"""
+    
+    @staticmethod
+    def run_command(cmd, shell=True):
+        """Execute shell command and return output"""
+        try:
+            # Platform-specific shell handling
+            if platform.system() == 'Windows':
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+            else:
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    executable='/bin/bash'
+                )
+            
+            return {
+                'success': result.returncode == 0,
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'returncode': result.returncode
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'stdout': '',
+                'stderr': 'Command timed out',
+                'returncode': -1
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'stdout': '',
+                'stderr': str(e),
+                'returncode': -1
+            }
+    
+    @staticmethod
+    def check_hadoop_services():
+        """Check if Hadoop services are running"""
+        try:
+            # Check if HDFS and YARN web UIs are accessible
+            hdfs_response = requests.get('http://localhost:9870', timeout=2)
+            yarn_response = requests.get('http://localhost:8088', timeout=2)
+            
+            namenode_running = hdfs_response.status_code == 200
+            resourcemanager_running = yarn_response.status_code == 200
+            
+            return {
+                'namenode': namenode_running,
+                'resourcemanager': resourcemanager_running,
+                'running': namenode_running and resourcemanager_running
+            }
+        except:
+            return {'namenode': False, 'resourcemanager': False, 'running': False}
+    
+    @staticmethod
+    def start_hadoop_services():
+        """Start Hadoop services"""
+        if not HADOOP_HOME:
+            return {'dfs': False, 'yarn': False, 'error': 'HADOOP_HOME not set'}
+        
+        sbin_path = os.path.join(HADOOP_HOME, 'sbin')
+        
+        # Platform-specific commands
+        if platform.system() == 'Windows':
+            dfs_cmd = f'cd /d "{sbin_path}" && start-dfs.cmd'
+            yarn_cmd = f'cd /d "{sbin_path}" && start-yarn.cmd'
+        else:
+            dfs_cmd = f'cd "{sbin_path}" && ./start-dfs.sh'
+            yarn_cmd = f'cd "{sbin_path}" && ./start-yarn.sh'
+        
+        # Start DFS
+        dfs_result = HadoopManager.run_command(dfs_cmd)
+        time.sleep(5)
+        
+        # Start YARN
+        yarn_result = HadoopManager.run_command(yarn_cmd)
+        time.sleep(5)
+        
+        return {
+            'dfs': dfs_result['success'],
+            'yarn': yarn_result['success']
+        }
+    
+    @staticmethod
+    def stop_hadoop_services():
+        """Stop Hadoop services"""
+        if not HADOOP_HOME:
+            return {'dfs': False, 'yarn': False, 'error': 'HADOOP_HOME not set'}
+        
+        sbin_path = os.path.join(HADOOP_HOME, 'sbin')
+        
+        # Platform-specific commands
+        if platform.system() == 'Windows':
+            yarn_cmd = f'cd /d "{sbin_path}" && stop-yarn.cmd'
+            dfs_cmd = f'cd /d "{sbin_path}" && stop-dfs.cmd'
+        else:
+            yarn_cmd = f'cd "{sbin_path}" && ./stop-yarn.sh'
+            dfs_cmd = f'cd "{sbin_path}" && ./stop-dfs.sh'
+        
+        yarn_result = HadoopManager.run_command(yarn_cmd)
+        dfs_result = HadoopManager.run_command(dfs_cmd)
+        
+        return {
+            'dfs': dfs_result['success'],
+            'yarn': yarn_result['success']
+        }
+    
+    @staticmethod
+    def upload_to_hdfs(local_path, hdfs_path):
+        """Upload file to HDFS with verification"""
+        # Create HDFS directory if needed
+        HadoopManager.run_command(f'hdfs dfs -mkdir -p {os.path.dirname(hdfs_path)}')
+        
+        # Remove existing file
+        HadoopManager.run_command(f'hdfs dfs -rm -f {hdfs_path}')
+        
+        # Upload file (quote path for spaces)
+        result = HadoopManager.run_command(f'hdfs dfs -put "{local_path}" {hdfs_path}')
+        
+        if not result['success']:
+            return False
+        
+        # WAIT for upload to complete
+        time.sleep(3)
+        
+        # VERIFY file exists in HDFS
+        verify = HadoopManager.run_command(f'hdfs dfs -test -e {hdfs_path}')
+        
+        return verify['success']
+    
+    @staticmethod
+    def remove_hdfs_path(hdfs_path):
+        """Remove HDFS path"""
+        result = HadoopManager.run_command(f'hdfs dfs -rm -r -f {hdfs_path}')
+        return result['success']
+    
+    @staticmethod
+    def read_hdfs_file(hdfs_path):
+        """Read content from HDFS file"""
+        result = HadoopManager.run_command(f'hdfs dfs -cat {hdfs_path}')
+        if result['success']:
+            return result['stdout']
+        return None
+    
+    @staticmethod
+    def list_hdfs_directory(hdfs_path):
+        """List HDFS directory contents"""
+        result = HadoopManager.run_command(f'hdfs dfs -ls {hdfs_path}')
+        if result['success']:
+            return result['stdout']
+        return None
+    
+    @staticmethod
+    def run_mapreduce_job(input_path, output_path, min_support, min_confidence, total_transactions):
+        """Run MapReduce job"""
+        if not JAR_PATH or not os.path.exists(JAR_PATH):
+            return {
+                'success': False,
+                'stdout': '',
+                'stderr': 'JAR file not found. Please compile the Java code first.'
+            }
+        
+        # Remove output directory if exists
+        HadoopManager.remove_hdfs_path(output_path)
+        
+        # Run job (quote JAR path for spaces)
+        cmd = f'hadoop jar "{JAR_PATH}" MarketBasketDriver {input_path} {output_path} {min_support} {min_confidence} {total_transactions}'
+        result = HadoopManager.run_command(cmd)
+        
+        return {
+            'success': result['success'],
+            'stdout': result['stdout'],
+            'stderr': result['stderr']
+        }
+
+
+@app.route('/')
+def index():
+    """Serve main page"""
+    return render_template('index.html')
+
+
+@app.route('/api/status', methods=['GET'])
+def check_status():
+    """Check Hadoop service status"""
+    status = HadoopManager.check_hadoop_services()
+    status['hadoop_home'] = HADOOP_HOME
+    status['jar_path'] = JAR_PATH
+    return jsonify(status)
+
+
+@app.route('/api/services/start', methods=['POST'])
+def start_services():
+    """Start Hadoop services"""
+    result = HadoopManager.start_hadoop_services()
+    # Wait and check status
+    time.sleep(10)
+    status = HadoopManager.check_hadoop_services()
+    
+    return jsonify({
+        'success': status['running'],
+        'status': status,
+        'message': 'Services started' if status['running'] else 'Failed to start services'
+    })
+
+
+@app.route('/api/services/stop', methods=['POST'])
+def stop_services():
+    """Stop Hadoop services"""
+    result = HadoopManager.stop_hadoop_services()
+    return jsonify({
+        'success': True,
+        'message': 'Services stopped'
+    })
+
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    """Handle file upload"""
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'message': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'success': False, 'message': 'No file selected'}), 400
+    
+    # Save file locally
+    job_id = str(uuid.uuid4())
+    filename = f"{job_id}_{file.filename}"
+    local_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(local_path)
+    
+    # Count transactions
+    with open(local_path, 'r', encoding='utf-8', errors='ignore') as f:
+        total_transactions = sum(1 for line in f if line.strip())
+    
+    # Upload to HDFS
+    hdfs_input_path = f"{HDFS_INPUT}/{filename}"
+    upload_success = HadoopManager.upload_to_hdfs(local_path, hdfs_input_path)
+    
+    if not upload_success:
+        return jsonify({
+            'success': False,
+            'message': 'Failed to upload to HDFS'
+        }), 500
+    
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'filename': filename,
+        'total_transactions': total_transactions,
+        'hdfs_path': hdfs_input_path,
+        'message': 'File uploaded successfully'
+    })
+
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze():
+    """Run analysis job"""
+    data = request.get_json()
+    
+    job_id = data.get('job_id')
+    filename = data.get('filename')
+    min_support = int(data.get('min_support', 50))
+    min_confidence = float(data.get('min_confidence', 0.5))
+    total_transactions = int(data.get('total_transactions', 1000))
+    
+    # HDFS paths
+    input_path = f"{HDFS_INPUT}/{filename}"
+    output_path = f"{HDFS_OUTPUT}/{job_id}"
+    
+    # Run MapReduce job
+    result = HadoopManager.run_mapreduce_job(
+        input_path,
+        output_path,
+        min_support,
+        min_confidence,
+        total_transactions
+    )
+    
+    if not result['success']:
+        return jsonify({
+            'success': False,
+            'message': 'MapReduce job failed',
+            'error': result['stderr']
+        }), 500
+    
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'output_path': output_path,
+        'message': 'Analysis completed successfully'
+    })
+
+
+@app.route('/api/results/<job_id>', methods=['GET'])
+def get_results(job_id):
+    """Get analysis results"""
+    output_path = f"{HDFS_OUTPUT}/{job_id}"
+    
+    results = {}
+    
+    # Read frequent items (Pass 1)
+    frequent_items_path = f"{output_path}/pass1_frequent_items/part-r-00000"
+    frequent_items_content = HadoopManager.read_hdfs_file(frequent_items_path)
+    
+    if frequent_items_content:
+        items = []
+        for line in frequent_items_content.strip().split('\n'):
+            if line.strip():
+                parts = line.split('\t')
+                if len(parts) == 2:
+                    items.append({'item': parts[0], 'count': int(parts[1])})
+        results['frequent_items'] = items
+    
+    # Read frequent pairs (Pass 2)
+    frequent_pairs_path = f"{output_path}/pass2_frequent_pairs/part-r-00000"
+    frequent_pairs_content = HadoopManager.read_hdfs_file(frequent_pairs_path)
+    
+    if frequent_pairs_content:
+        pairs = []
+        for line in frequent_pairs_content.strip().split('\n'):
+            if line.strip():
+                parts = line.split('\t')
+                if len(parts) == 2:
+                    pairs.append({'pair': parts[0], 'count': int(parts[1])})
+        results['frequent_pairs'] = pairs
+    
+    # Read association rules (Pass 3)
+    rules_path = f"{output_path}/pass3_association_rules/part-r-00000"
+    rules_content = HadoopManager.read_hdfs_file(rules_path)
+    
+    if rules_content:
+        rules = []
+        for line in rules_content.strip().split('\n'):
+            if line.strip():
+                parts = line.split('\t')
+                if len(parts) == 2:
+                    rule_text = parts[0]
+                    metrics_text = parts[1]
+                    
+                    # Parse metrics (Support: X, Confidence: Y, Lift: Z)
+                    metrics = {}
+                    for metric in metrics_text.split(','):
+                        if ':' in metric:
+                            key, value = metric.split(':')
+                            metrics[key.strip().lower()] = float(value.strip())
+                    
+                    rules.append({
+                        'rule': rule_text,
+                        'support': metrics.get('support', 0),
+                        'confidence': metrics.get('confidence', 0),
+                        'lift': metrics.get('lift', 0)
+                    })
+        results['rules'] = sorted(rules, key=lambda x: x['lift'], reverse=True)
+    
+    return jsonify({
+        'success': True,
+        'results': results
+    })
+
+
+@app.route('/api/download/<job_id>', methods=['GET'])
+def download_results(job_id):
+    """Download results as text file"""
+    output_path = f"{HDFS_OUTPUT}/{job_id}"
+    rules_path = f"{output_path}/pass3_association_rules/part-r-00000"
+    
+    # Download from HDFS to temp file
+    local_temp = f"temp_{job_id}_results.txt"
+    HadoopManager.run_command(f'hdfs dfs -get {rules_path} {local_temp}')
+    
+    if os.path.exists(local_temp):
+        return send_file(local_temp, as_attachment=True, download_name=f'association_rules_{job_id}.txt')
+    
+    return jsonify({'success': False, 'message': 'Results not found'}), 404
+
+
+@app.route('/api/yarn/applications', methods=['GET'])
+def get_yarn_applications():
+    """Get YARN application status"""
+    result = HadoopManager.run_command('yarn application -list')
+    
+    return jsonify({
+        'success': result['success'],
+        'output': result['stdout']
+    })
+
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("Market Basket Analysis - Hadoop Web Interface")
+    print("=" * 60)
+    print(f"HADOOP_HOME: {HADOOP_HOME}")
+    print(f"JAR Path: {JAR_PATH}")
+    print("Starting Flask server on http://localhost:5000")
+    print("=" * 60)
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+

@@ -1,0 +1,190 @@
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
+/**
+ * Market Basket Analysis Driver - Apriori Algorithm Implementation
+ * 
+ * Multi-pass MapReduce implementation:
+ * Pass 1: Find frequent 1-itemsets (individual items)
+ * Pass 2: Find frequent 2-itemsets (item pairs)
+ * Pass 3: Generate association rules with confidence and lift
+ * 
+ * FIXED VERSION - Corrected argument parsing
+ */
+public class MarketBasketDriver {
+    
+    public static void main(String[] args) throws Exception {
+        
+        // Validate arguments
+        if (args.length < 5) {
+            System.err.println("Usage: MarketBasketDriver <input> <output> <minSupport> <minConfidence> <totalTransactions>");
+            System.err.println("Example: MarketBasketDriver /mba/input /mba/output 50 0.5 5000");
+            System.err.println();
+            System.err.println("Received " + args.length + " arguments:");
+            for (int i = 0; i < args.length; i++) {
+                System.err.println("  args[" + i + "] = " + args[i]);
+            }
+            System.exit(1);
+        }
+        
+        // Parse arguments with validation
+        String inputPath = args[0];
+        String outputBasePath = args[1];
+        
+        // Parse numeric arguments with error handling
+        int minSupport;
+        double minConfidence;
+        int totalTransactions;
+        
+        try {
+            minSupport = Integer.parseInt(args[2]);
+        } catch (NumberFormatException e) {
+            System.err.println("ERROR: Invalid minSupport value: " + args[2]);
+            System.err.println("minSupport must be an integer (e.g., 50)");
+            System.exit(1);
+            return;
+        }
+        
+        try {
+            minConfidence = Double.parseDouble(args[3]);
+        } catch (NumberFormatException e) {
+            System.err.println("ERROR: Invalid minConfidence value: " + args[3]);
+            System.err.println("minConfidence must be a decimal (e.g., 0.5)");
+            System.exit(1);
+            return;
+        }
+        
+        try {
+            totalTransactions = Integer.parseInt(args[4]);
+        } catch (NumberFormatException e) {
+            System.err.println("ERROR: Invalid totalTransactions value: " + args[4]);
+            System.err.println("totalTransactions must be an integer (e.g., 5000)");
+            System.exit(1);
+            return;
+        }
+        
+        // Print configuration
+        System.out.println("=== Market Basket Analysis - Apriori Algorithm ===");
+        System.out.println("Input: " + inputPath);
+        System.out.println("Output: " + outputBasePath);
+        System.out.println("Min Support: " + minSupport);
+        System.out.println("Min Confidence: " + minConfidence);
+        System.out.println("Total Transactions: " + totalTransactions);
+        System.out.println();
+        
+        // ========== PASS 1: Find Frequent 1-Itemsets ==========
+        System.out.println(">>> PASS 1: Finding Frequent 1-Itemsets...");
+        
+        Configuration conf1 = new Configuration();
+        conf1.setInt("min.support", minSupport);
+        
+        Job job1 = Job.getInstance(conf1, "MBA Pass 1: Frequent Items");
+        job1.setJarByClass(MarketBasketDriver.class);
+        job1.setMapperClass(Pass1Mapper.class);
+        job1.setReducerClass(Pass1Reducer.class);
+        job1.setOutputKeyClass(Text.class);
+        job1.setOutputValueClass(IntWritable.class);
+        
+        FileInputFormat.addInputPath(job1, new Path(inputPath));
+        Path pass1Output = new Path(outputBasePath + "/pass1_frequent_items");
+        FileOutputFormat.setOutputPath(job1, pass1Output);
+        
+        if (!job1.waitForCompletion(true)) {
+            System.err.println("Pass 1 failed!");
+            System.exit(1);
+        }
+        
+        System.out.println(">>> PASS 1 Complete!");
+        System.out.println();
+        
+        // Download Pass 1 output for Pass 2
+        String frequentItemsFile = downloadHDFSFile(pass1Output + "/part-r-00000", 
+                                                     "/tmp/frequent_items.txt");
+        
+        // ========== PASS 2: Find Frequent 2-Itemsets ==========
+        System.out.println(">>> PASS 2: Finding Frequent 2-Itemsets (Pairs)...");
+        
+        Configuration conf2 = new Configuration();
+        conf2.setInt("min.support", minSupport);
+        conf2.set("frequent.items.path", frequentItemsFile);
+        
+        Job job2 = Job.getInstance(conf2, "MBA Pass 2: Frequent Pairs");
+        job2.setJarByClass(MarketBasketDriver.class);
+        job2.setMapperClass(Pass2Mapper.class);
+        job2.setReducerClass(Pass2Reducer.class);
+        job2.setOutputKeyClass(Text.class);
+        job2.setOutputValueClass(IntWritable.class);
+        
+        FileInputFormat.addInputPath(job2, new Path(inputPath));
+        Path pass2Output = new Path(outputBasePath + "/pass2_frequent_pairs");
+        FileOutputFormat.setOutputPath(job2, pass2Output);
+        
+        if (!job2.waitForCompletion(true)) {
+            System.err.println("Pass 2 failed!");
+            System.exit(1);
+        }
+        
+        System.out.println(">>> PASS 2 Complete!");
+        System.out.println();
+        
+        // Download outputs for Pass 3
+        String frequentPairsFile = downloadHDFSFile(pass2Output + "/part-r-00000",
+                                                     "/tmp/frequent_pairs.txt");
+        
+        // ========== PASS 3: Generate Association Rules ==========
+        System.out.println(">>> PASS 3: Generating Association Rules...");
+        
+        Configuration conf3 = new Configuration();
+        conf3.setDouble("min.confidence", minConfidence);
+        conf3.setInt("total.transactions", totalTransactions);
+        conf3.set("item.counts.path", frequentItemsFile);
+        
+        Job job3 = Job.getInstance(conf3, "MBA Pass 3: Association Rules");
+        job3.setJarByClass(MarketBasketDriver.class);
+        job3.setMapperClass(AssociationRuleMapper.class);
+        job3.setReducerClass(AssociationRuleReducer.class);
+        job3.setOutputKeyClass(Text.class);
+        job3.setOutputValueClass(Text.class);
+        
+        // Input is the Pass 2 output (frequent pairs)
+        FileInputFormat.addInputPath(job3, pass2Output);
+        Path pass3Output = new Path(outputBasePath + "/pass3_association_rules");
+        FileOutputFormat.setOutputPath(job3, pass3Output);
+        
+        if (!job3.waitForCompletion(true)) {
+            System.err.println("Pass 3 failed!");
+            System.exit(1);
+        }
+        
+        System.out.println(">>> PASS 3 Complete!");
+        System.out.println();
+        System.out.println("=== Market Basket Analysis Complete! ===");
+        System.out.println("Results stored in:");
+        System.out.println("  - Frequent Items: " + pass1Output);
+        System.out.println("  - Frequent Pairs: " + pass2Output);
+        System.out.println("  - Association Rules: " + pass3Output);
+        
+        System.exit(0);
+    }
+    
+    /**
+     * Download a file from HDFS to local filesystem
+     */
+    private static String downloadHDFSFile(String hdfsPath, String localPath) throws Exception {
+        Configuration conf = new Configuration();
+        FileSystem fs = FileSystem.get(conf);
+        Path hdfs = new Path(hdfsPath);
+        Path local = new Path(localPath);
+        
+        fs.copyToLocalFile(hdfs, local);
+        return localPath;
+    }
+}
